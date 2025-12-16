@@ -16,11 +16,16 @@ jobs:
           # 50/50 chance to output the flaky error or a different error
           if [ $((RANDOM % 2)) -eq 0 ]; then
             echo "🎲 Randomly selected: FLAKY ERROR (will trigger retry)"
-            echo "Error: buildx failed with: ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly"
+            ERROR_MSG="Error: buildx failed with: ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly"
+            echo "$ERROR_MSG"
           else
             echo "🎲 Randomly selected: DIFFERENT ERROR (will NOT trigger retry)"
-            echo "Error: Some completely different error that doesn't match the flaky pattern"
+            ERROR_MSG="Error: Some completely different error that doesn't match the flaky pattern"
+            echo "$ERROR_MSG"
           fi
+          
+          # Write error to file for next step to read
+          echo "$ERROR_MSG" > /tmp/step-error.txt
           
           exit 1
 
@@ -29,74 +34,28 @@ jobs:
         id: check-error
         shell: bash
         run: |
-          echo "Step failed, fetching logs to check if retry is needed..."
+          echo "Step failed, checking error message..."
           
-          # Wait a moment for logs to be available
-          sleep 5
-          
-          # Use GitHub API to fetch the logs for this workflow run
-          LOGS_URL="https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/logs"
-          
-          # Download logs using GitHub API token
-          # Retry a few times in case logs aren't immediately available
-          for i in 1 2 3; do
-            if curl -f -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "$LOGS_URL" -o /tmp/workflow-logs.zip; then
-              break
-            fi
-            if [ $i -eq 3 ]; then
-              echo "Failed to download logs after retries, will not retry"
+          # Read the error from the file written by the failing step
+          if [ -f /tmp/step-error.txt ]; then
+            ERROR_CONTENT=$(cat /tmp/step-error.txt)
+            echo "Error message captured: $ERROR_CONTENT"
+            
+            # Check if the error matches the specific flaky error pattern
+            if echo "$ERROR_CONTENT" | grep -q "Error: buildx failed with: ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly"; then
+              echo "✅ Detected flaky grpc server error, will retry"
+              echo "should_retry=true" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Different error detected, will not retry"
               echo "should_retry=false" >> $GITHUB_OUTPUT
-              exit 0
             fi
-            echo "Logs not available yet, retrying in 5s..."
-            sleep 5
-          done
-          
-          # Extract the zip file
-          if ! unzip -q /tmp/workflow-logs.zip -d /tmp/workflow-logs/ 2>/dev/null; then
-            echo "Failed to extract logs, will not retry"
-            echo "should_retry=false" >> $GITHUB_OUTPUT
-            rm -f /tmp/workflow-logs.zip
-            exit 0
-          fi
-          
-          # Find the log file for the failing step
-          STEP_LOG=""
-          for pattern in "*Failing step*" "*failing-step*"; do
-            STEP_LOG=$(find /tmp/workflow-logs -type f -iname "$pattern" | head -1)
-            if [ -n "$STEP_LOG" ]; then
-              break
-            fi
-          done
-          
-          # If still not found, try to find any log file and search in all of them
-          if [ -z "$STEP_LOG" ]; then
-            echo "Could not find Failing step log by name, searching all logs..."
-            STEP_LOG=$(find /tmp/workflow-logs -type f | head -1)
-          fi
-          
-          if [ -z "$STEP_LOG" ] || [ ! -f "$STEP_LOG" ]; then
-            echo "Could not find Failing step log, will not retry"
-            echo "should_retry=false" >> $GITHUB_OUTPUT
-            rm -rf /tmp/workflow-logs /tmp/workflow-logs.zip
-            exit 0
-          fi
-          
-          # Check if the error matches the specific flaky error pattern
-          if grep -q "Error: buildx failed with: ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly" "$STEP_LOG" 2>/dev/null || \
-             grep -q "ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly" "$STEP_LOG" 2>/dev/null || \
-             (find /tmp/workflow-logs -type f -exec grep -q "Error: buildx failed with: ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly" {} \; 2>/dev/null); then
-            echo "Detected flaky grpc server error, will retry"
-            echo "should_retry=true" >> $GITHUB_OUTPUT
           else
-            echo "Step failed with a different error, will not retry"
+            echo "⚠️ Could not find error file, will not retry"
             echo "should_retry=false" >> $GITHUB_OUTPUT
           fi
           
           # Clean up
-          rm -rf /tmp/workflow-logs /tmp/workflow-logs.zip
+          rm -f /tmp/step-error.txt
 
       - name: Sleep before retry
         if: steps.failing-step.outcome == 'failure' && steps.check-error.outputs.should_retry == 'true'
