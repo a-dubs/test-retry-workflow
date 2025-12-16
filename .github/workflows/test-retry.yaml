@@ -1,0 +1,142 @@
+name: Test Retry Mechanism
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-retry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Failing step
+        id: failing-step
+        continue-on-error: true
+        run: |
+          echo "This is a test step that will fail"
+          
+          # 50/50 chance to output the flaky error or a different error
+          if [ $((RANDOM % 2)) -eq 0 ]; then
+            echo "🎲 Randomly selected: FLAKY ERROR (will trigger retry)"
+            echo "Error: buildx failed with: ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly"
+          else
+            echo "🎲 Randomly selected: DIFFERENT ERROR (will NOT trigger retry)"
+            echo "Error: Some completely different error that doesn't match the flaky pattern"
+          fi
+          
+          exit 1
+
+      - name: Check error and retry if needed
+        if: steps.failing-step.outcome == 'failure'
+        id: check-error
+        shell: bash
+        run: |
+          echo "Step failed, fetching logs to check if retry is needed..."
+          
+          # Wait a moment for logs to be available
+          sleep 5
+          
+          # Use GitHub API to fetch the logs for this workflow run
+          LOGS_URL="https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/logs"
+          
+          # Download logs using GitHub API token
+          # Retry a few times in case logs aren't immediately available
+          for i in 1 2 3; do
+            if curl -f -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "$LOGS_URL" -o /tmp/workflow-logs.zip; then
+              break
+            fi
+            if [ $i -eq 3 ]; then
+              echo "Failed to download logs after retries, will not retry"
+              echo "should_retry=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Logs not available yet, retrying in 5s..."
+            sleep 5
+          done
+          
+          # Extract the zip file
+          if ! unzip -q /tmp/workflow-logs.zip -d /tmp/workflow-logs/ 2>/dev/null; then
+            echo "Failed to extract logs, will not retry"
+            echo "should_retry=false" >> $GITHUB_OUTPUT
+            rm -f /tmp/workflow-logs.zip
+            exit 0
+          fi
+          
+          # Find the log file for the failing step
+          STEP_LOG=""
+          for pattern in "*Failing step*" "*failing-step*"; do
+            STEP_LOG=$(find /tmp/workflow-logs -type f -iname "$pattern" | head -1)
+            if [ -n "$STEP_LOG" ]; then
+              break
+            fi
+          done
+          
+          # If still not found, try to find any log file and search in all of them
+          if [ -z "$STEP_LOG" ]; then
+            echo "Could not find Failing step log by name, searching all logs..."
+            STEP_LOG=$(find /tmp/workflow-logs -type f | head -1)
+          fi
+          
+          if [ -z "$STEP_LOG" ] || [ ! -f "$STEP_LOG" ]; then
+            echo "Could not find Failing step log, will not retry"
+            echo "should_retry=false" >> $GITHUB_OUTPUT
+            rm -rf /tmp/workflow-logs /tmp/workflow-logs.zip
+            exit 0
+          fi
+          
+          # Check if the error matches the specific flaky error pattern
+          if grep -q "Error: buildx failed with: ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly" "$STEP_LOG" 2>/dev/null || \
+             grep -q "ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly" "$STEP_LOG" 2>/dev/null || \
+             (find /tmp/workflow-logs -type f -exec grep -q "Error: buildx failed with: ERROR: failed to build: failed to solve: frontend grpc server closed unexpectedly" {} \; 2>/dev/null); then
+            echo "Detected flaky grpc server error, will retry"
+            echo "should_retry=true" >> $GITHUB_OUTPUT
+          else
+            echo "Step failed with a different error, will not retry"
+            echo "should_retry=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Clean up
+          rm -rf /tmp/workflow-logs /tmp/workflow-logs.zip
+
+      - name: Sleep before retry
+        if: steps.failing-step.outcome == 'failure' && steps.check-error.outputs.should_retry == 'true'
+        run: |
+          echo "Sleeping for 30s before retry..."
+          sleep 30
+
+      - name: Retry step
+        if: steps.failing-step.outcome == 'failure' && steps.check-error.outputs.should_retry == 'true'
+        id: retry-step
+        run: |
+          echo "This is the retry step"
+          echo "Retry successful!"
+
+      - name: Fail if step did not succeed
+        if: steps.failing-step.outcome == 'failure' && (steps.check-error.outputs.should_retry != 'true' || steps['retry-step'].outcome != 'success')
+        run: |
+          echo "Step failed and retry was not attempted or retry also failed"
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "TEST SUMMARY"
+          echo "=========================================="
+          echo "Failing step outcome: ${{ steps.failing-step.outcome }}"
+          echo "Should retry: ${{ steps.check-error.outputs.should_retry }}"
+          if [ "${{ steps.failing-step.outcome }}" == "failure" ]; then
+            if [ "${{ steps.check-error.outputs.should_retry }}" == "true" ]; then
+              if [ "${{ steps.retry-step.outcome }}" == "success" ]; then
+                echo "✅ RESULT: Flaky error detected → Retry succeeded → Job should pass"
+              else
+                echo "❌ RESULT: Flaky error detected → Retry failed → Job should fail"
+              fi
+            else
+              echo "❌ RESULT: Different error (not flaky) → No retry → Job should fail"
+            fi
+          else
+            echo "✅ RESULT: First step succeeded → No retry needed → Job should pass"
+          fi
+          echo "=========================================="
+
