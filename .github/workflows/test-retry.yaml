@@ -46,30 +46,36 @@ jobs:
           # Try GitHub CLI first if available (more reliable)
           if command -v gh &> /dev/null; then
             echo "Using GitHub CLI to fetch logs..."
-            # Authenticate GitHub CLI
-            echo "$GITHUB_TOKEN" | gh auth login --with-token
             
             # Wait a bit for logs to be available, then try to download
             for wait_time in 10 20 30; do
               echo "Waiting ${wait_time}s for logs to be available..."
               sleep $wait_time
               
+              # GitHub CLI automatically uses GITHUB_TOKEN from environment
               if gh run view ${{ github.run_id }} --log > /tmp/workflow-logs.txt 2>&1; then
-                echo "Successfully fetched logs via GitHub CLI"
-                if check_error_pattern /tmp/workflow-logs.txt; then
-                  echo "✅ Detected flaky grpc server error, will retry"
-                  echo "should_retry=true" >> $GITHUB_OUTPUT
-                  rm -f /tmp/workflow-logs.txt
-                  exit 0
+                # Check if we actually got logs (not an error message)
+                if [ -s /tmp/workflow-logs.txt ] && ! grep -q "^Error:" /tmp/workflow-logs.txt; then
+                  echo "Successfully fetched logs via GitHub CLI"
+                  if check_error_pattern /tmp/workflow-logs.txt; then
+                    echo "✅ Detected flaky grpc server error, will retry"
+                    echo "should_retry=true" >> $GITHUB_OUTPUT
+                    rm -f /tmp/workflow-logs.txt
+                    exit 0
+                  else
+                    echo "❌ Build failed with a different error, will not retry"
+                    echo "should_retry=false" >> $GITHUB_OUTPUT
+                    rm -f /tmp/workflow-logs.txt
+                    exit 0
+                  fi
                 else
-                  echo "❌ Build failed with a different error, will not retry"
-                  echo "should_retry=false" >> $GITHUB_OUTPUT
-                  rm -f /tmp/workflow-logs.txt
-                  exit 0
+                  echo "GitHub CLI returned error or empty logs, will try API..."
                 fi
+              else
+                echo "GitHub CLI fetch attempt failed, will try API..."
               fi
             done
-            echo "GitHub CLI method failed, trying API..."
+            echo "GitHub CLI method failed after all attempts, trying API..."
           fi
           
           # Fallback to GitHub API with longer waits
